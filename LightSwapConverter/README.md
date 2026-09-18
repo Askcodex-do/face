@@ -78,7 +78,8 @@ LightSwapConverter/
         alignment.py        similarity, affine and homography fits
         transformer.py      warping, colour transfer, sharpening
         blender.py          feathered alpha and seamless compositing
-        processor.py        pipeline orchestration
+        processor.py        video processing engine (frame loop, progress, cancel)
+        swapper.py          face pipeline orchestration over the engine
     utils/
         __init__.py
         config.py           dataclass configuration, JSON persistence

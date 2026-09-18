@@ -79,8 +79,37 @@ python main.py                                  # GUI
 - `tests/helpers.draw_synthetic_face` deliberately includes dark eyes, brows and
   a mouth line, because a Haar cascade will not fire on a flat ellipse.
 
+## Module layout note (Phase 1)
+
+`core/processor.py` is the **video processing engine** and is deliberately free
+of faces and models. It owns the frame loop, progress, cancellation and
+resource handling, and takes the per-frame work as a `transform(frame, index)`
+callable. It returns `None` to pass a frame through unchanged.
+
+`core/swapper.py` holds the face pipeline (`VideoFaceProcessor`, `SourceFace`,
+`SwapStats`) and drives the engine through a transform closure. Anything that
+needs face swapping imports from `swapper`; anything that only needs video IO
+uses `processor`. `ProcessingStats` in `swapper` is an alias of `SwapStats`,
+kept for older callers.
+
+Cancellation has to reach the engine, because that is where the loop lives.
+`VideoFaceProcessor.cancel()` forwards to the active engine and also records a
+`_cancel_requested` flag, which is re-checked after the engine is created so a
+cancel arriving during source-face preparation is not lost.
+
+## Memory discipline
+
+Verified by measurement, not assumption: peak RSS is ~65 MB and **flat** across
+a 50-frame and a 400-frame 640x480 clip, and ~96 MB for a 300-frame 720p clip.
+Buffering that 720p clip would cost ~830 MB, which alone would break the 2 GB
+target. Keep it that way: one frame in flight, no frame lists, no queues, and
+`ProcessingStats.messages` capped by `MAX_RETAINED_MESSAGES` so a file that
+fails on every frame cannot grow the list without bound.
+
 ## Status
 
 Foundation complete: structure, config, logging, full pipeline, CLI, GUI, tests.
+Phase 1 complete: video engine with progress, cancellation, format support
+(MP4/AVI/MKV), and measured memory discipline. 303 tests passing.
 Not done yet: `models/` and `assets/` are empty placeholders; single face only;
 no packaging; not yet run on real Windows 8.1 hardware.

@@ -23,11 +23,8 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 import numpy as np
 
-from ..core.processor import (
-    ProcessingStats,
-    ProcessorError,
-    VideoFaceProcessor,
-)
+from ..core.processor import ProcessorError
+from ..core.swapper import ProcessingStats, VideoFaceProcessor
 from ..core.video_reader import VideoReadError, VideoReader
 from ..utils.config import ASSETS_DIR, AppConfig
 from ..utils.logger import get_logger, get_memory_handler, setup_logging

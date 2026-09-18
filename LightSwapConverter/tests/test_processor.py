@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import pytest
 
-from LightSwapConverter.core.processor import (
+from LightSwapConverter.core.swapper import (
     ProcessingStats,
     ProcessorError,
     SourceFace,
@@ -303,8 +303,9 @@ class TestCancellation:
 
     def test_reset_clears_the_cancel_flag(self, processor):
         processor.cancel()
+        assert processor._cancel_requested is True
         processor.reset()
-        assert processor._cancelled is False
+        assert processor._cancel_requested is False
 
     def test_a_partial_output_file_is_still_written(
         self, processor, face_image, target_video, tmp_path: Path

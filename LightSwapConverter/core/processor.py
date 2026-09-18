@@ -1,11 +1,22 @@
-"""Pipeline orchestration: turn a source face plus a target video into output.
+"""Phase 1: the lightweight video processing engine.
 
-This module is the only place that knows the order of the stages. Every stage is
-injected as an object with a small interface, so the processor itself has no
-image processing code and is straightforward to test with stubs.
+This module turns an input video into an output video one frame at a time. It
+owns the processing loop, progress reporting, cancellation and resource
+cleanup, and nothing else. The per-frame work is supplied by the caller as a
+``transform`` callable, so the engine has no opinion about what is done to the
+pixels.
 
-The processing loop is deliberately conservative about memory: one frame is
-decoded, converted and written before the next is read. Nothing accumulates.
+Design notes for the 2 GB target machine:
+
+* Exactly one decoded frame and one output frame are alive at a time. No frame
+  list, ring buffer or queue is ever built.
+* Each frame is decoded, transformed and written before the next decode, so
+  peak memory is a small multiple of one frame rather than of the whole video.
+* ``VideoCapture`` and ``VideoWriter`` are released on every exit path,
+  including a raising transform, a cancel, and a write failure.
+
+The engine deliberately contains no face detection, no face swapping and no
+model inference. Those plug in through ``transform`` in a later phase.
 """
 
 from __future__ import annotations
@@ -20,22 +31,25 @@ import numpy as np
 
 from ..utils.config import AppConfig
 from ..utils.logger import get_logger
-from .alignment import AlignmentError, align_to_face
-from .blender import BlendError, FaceBlender
-from .face_detector import FaceBox, FaceDetector
-from .landmarks import LandmarkEstimator, Landmarks
-from .transformer import FaceTransformer, TransformError
-from .video_reader import VideoReader
-from .video_writer import VideoWriter
+from .video_reader import VideoInfo, VideoReadError, VideoReader
+from .video_writer import VideoWriteError, VideoWriter
 
 log = get_logger("core.processor")
 
 #: ``(completed, total, message)``. ``total`` is 0 when it is unknown.
 ProgressCallback = Callable[[int, int, str], None]
-#: ``(frame_index, frame)`` used for live previews. The frame is a copy.
+#: ``(frame_index, frame)`` for live previews. The buffer can be reused after
+#: the callback returns, so copy it if you intend to keep it.
 PreviewCallback = Callable[[int, np.ndarray], None]
-#: Called for each frame that could not be processed, for reporting.
+#: ``(frame_index, message)`` called for each frame that could not be handled.
 ErrorCallback = Callable[[int, str], None]
+#: ``(frame, index) -> frame | None``. Returning ``None`` passes the frame
+#: through untouched, which is how a transform declines a frame it cannot use.
+FrameTransform = Callable[[np.ndarray, int], Optional[np.ndarray]]
+
+#: Cap on retained per-frame error messages. A pathological file could fail on
+#: every frame, and an unbounded list would grow with the video length.
+MAX_RETAINED_MESSAGES = 200
 
 
 class ProcessorError(RuntimeError):
@@ -47,297 +61,386 @@ class CancelledError(RuntimeError):
 
 
 @dataclass
-class SourceFace:
-    """A prepared source face: the image plus its landmarks."""
-
-    image: np.ndarray
-    landmarks: Landmarks
-    box: FaceBox
-
-    @property
-    def size(self) -> tuple[int, int]:
-        return self.image.shape[1], self.image.shape[0]
-
-
-@dataclass
 class ProcessingStats:
-    """Counters collected while a conversion runs."""
+    """Counters collected while a conversion runs.
+
+    ``frames_read`` counts decoded frames and ``frames_written`` counts encoded
+    frames; they differ only when a frame cannot be written. ``frames_processed``
+    splits into the frames the transform changed and the frames it declined.
+    """
 
     frames_read: int = 0
     frames_written: int = 0
-    frames_swapped: int = 0
-    frames_skipped: int = 0
+    frames_transformed: int = 0
+    frames_passed_through: int = 0
     errors: int = 0
+    cancelled: bool = False
     elapsed_seconds: float = 0.0
+    source_path: str = ""
     output_path: str = ""
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    duration_seconds: float = 0.0
     messages: List[str] = field(default_factory=list)
 
-    @property
-    def swap_rate(self) -> float:
-        if self.frames_read == 0:
-            return 0.0
-        return self.frames_swapped / float(self.frames_read)
+    def add_message(self, message: str) -> None:
+        """Record a diagnostic, keeping the list bounded on long failures."""
+        if len(self.messages) < MAX_RETAINED_MESSAGES:
+            self.messages.append(message)
 
     @property
-    def fps(self) -> float:
+    def frames_processed(self) -> int:
+        """Frames the loop handled, whether changed or passed through."""
+        return self.frames_transformed + self.frames_passed_through
+
+    @property
+    def completed(self) -> bool:
+        """True when the run reached the end of the input without cancelling."""
+        return not self.cancelled
+
+    @property
+    def transform_rate(self) -> float:
+        """Fraction of processed frames the transform actually changed."""
+        processed = self.frames_processed
+        if processed == 0:
+            return 0.0
+        return self.frames_transformed / float(processed)
+
+    @property
+    def processing_fps(self) -> float:
+        """Frames written per second of wall clock time."""
         if self.elapsed_seconds <= 0:
             return 0.0
         return self.frames_written / self.elapsed_seconds
 
     def summary(self) -> str:
+        state = "cancelled" if self.cancelled else "finished"
         return (
-            f"{self.frames_written} frames written in "
-            f"{self.elapsed_seconds:.1f}s ({self.fps:.1f} fps), "
-            f"{self.frames_swapped} swapped, {self.frames_skipped} without a face, "
-            f"{self.errors} errors"
+            f"{state}: {self.frames_written} frames written in "
+            f"{self.elapsed_seconds:.1f}s ({self.processing_fps:.1f} fps), "
+            f"{self.frames_transformed} transformed, "
+            f"{self.frames_passed_through} unchanged, {self.errors} errors"
         )
 
 
-class VideoFaceProcessor:
-    """Convert a video by replacing the face in every frame with a source face.
+def identity_transform(frame: np.ndarray, index: int) -> np.ndarray:
+    """A transform that changes nothing, useful as a default and in tests."""
+    return frame
 
-    Parameters
-    ----------
-    config:
-        Application configuration. Defaults are used when omitted.
-    detector, landmark_estimator, transformer, blender:
-        Stage implementations. They may be replaced with compatible objects,
-        which is how the tests exercise the loop without touching real images.
+
+class VideoProcessor:
+    """Frame-by-frame video conversion engine.
+
+    One instance can run several conversions. ``cancel`` applies to whichever
+    run is active::
+
+        def darker(frame, index):
+            return (frame * 0.8).astype(frame.dtype)
+
+        stats = VideoProcessor().process_video("in.mp4", "out.mp4", darker)
     """
 
-    def __init__(
-        self,
-        config: Optional[AppConfig] = None,
-        *,
-        detector: Optional[FaceDetector] = None,
-        landmark_estimator: Optional[LandmarkEstimator] = None,
-        transformer: Optional[FaceTransformer] = None,
-        blender: Optional[FaceBlender] = None,
-    ) -> None:
+    def __init__(self, config: Optional[AppConfig] = None) -> None:
         self.config = config or AppConfig()
-        self.detector = detector or FaceDetector(self.config.detection)
-        self.landmark_estimator = landmark_estimator or LandmarkEstimator(
-            self.config.landmarks
-        )
-        self.transformer = transformer or FaceTransformer(self.config.transform)
-        self.blender = blender or FaceBlender(self.config.blend)
-
         self._cancelled = False
-        self._source: Optional[SourceFace] = None
 
-    # -- cancellation -------------------------------------------------------
+    # -- control ------------------------------------------------------------
 
     def cancel(self) -> None:
-        """Ask the running conversion to stop after the current frame."""
+        """Ask the active conversion to stop after the current frame.
+
+        Cancellation is cooperative. The frame in flight is finished, the writer
+        is closed and the partial output is kept, so the caller never ends up
+        with an unfinalised container.
+        """
         self._cancelled = True
+        log.info("cancellation requested")
 
     def reset(self) -> None:
-        """Clear the cancel flag and per-run detector state."""
+        """Clear a stale cancel flag so the next run starts cleanly."""
         self._cancelled = False
-        self.detector.reset()
-        self.landmark_estimator.reset()
 
-    # -- source preparation -------------------------------------------------
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
 
-    def prepare_source_face(
-        self, image: np.ndarray, *, refine: bool = True
-    ) -> SourceFace:
-        """Detect and measure the face in a source image.
+    # -- metadata -----------------------------------------------------------
 
-        Raises :class:`ProcessorError` when no face is found, because a source
-        without a face makes the whole conversion pointless.
-        """
-        if image is None or image.size == 0:
-            raise ProcessorError("source face image is empty")
+    def inspect(self, path: str | Path) -> VideoInfo:
+        """Return the metadata of a video without decoding its frames."""
+        from .video_reader import probe
 
-        self.detector.reset()
-        box = self.detector.detect(image)
-        if box is None:
-            raise ProcessorError(
-                "no face detected in the source image; use a clear frontal photo"
-            )
+        return probe(path)
 
-        landmarks = self.landmark_estimator.estimate(image, box, refine=refine)
-        self._source = SourceFace(image, landmarks, box)
-        log.info(
-            "source face prepared: box=%s interocular=%.1fpx",
-            box.as_tuple(),
-            landmarks.eye_distance,
-        )
-        return self._source
-
-    def load_source_face(self, path: str | Path, *, refine: bool = True) -> SourceFace:
-        """Read an image from disk and prepare it as the source face."""
-        image = read_image(path)
-        return self.prepare_source_face(image, refine=refine)
-
-    # -- frame level --------------------------------------------------------
-
-    def process_frame(
-        self, frame: np.ndarray, source: SourceFace
-    ) -> tuple[np.ndarray, bool]:
-        """Replace the face in one frame.
-
-        Returns ``(frame, swapped)``. The original frame object is returned
-        unchanged when no face is found, so the caller can write it directly.
-        """
-        box = self.detector.detect(frame)
-        if box is None:
-            return frame, False
-
-        target_landmarks = self.landmark_estimator.estimate(frame, box)
-
-        try:
-            alignment = align_to_face(
-                source.landmarks, target_landmarks, box, method="similarity"
-            )
-        except AlignmentError as exc:
-            log.debug("alignment failed, skipping frame: %s", exc)
-            return frame, False
-
-        if not alignment.is_reliable:
-            # A bad fit means the head pose is too far from the source. Pasting
-            # anyway produces a smeared face, so the frame is left alone.
-            log.debug("alignment rejected: %s", alignment)
-            return frame, False
-
-        try:
-            warped = self.transformer.build_patch(
-                source.image, source.landmarks, alignment, box, frame
-            )
-        except TransformError as exc:
-            log.debug("warp failed, skipping frame: %s", exc)
-            return frame, False
-
-        try:
-            blended, _stats = self.blender.blend(frame, warped, target_landmarks)
-        except BlendError as exc:
-            log.debug("blend failed, skipping frame: %s", exc)
-            return frame, False
-
-        return blended, True
-
-    # -- video level --------------------------------------------------------
+    # -- conversion ---------------------------------------------------------
 
     def process_video(
         self,
-        source_face_path: str | Path,
-        target_video_path: str | Path,
+        input_path: str | Path,
         output_path: str | Path,
+        transform: Optional[FrameTransform] = None,
         *,
         progress: Optional[ProgressCallback] = None,
         preview: Optional[PreviewCallback] = None,
         on_error: Optional[ErrorCallback] = None,
         start_frame: int = 0,
+        max_frames: Optional[int] = None,
     ) -> ProcessingStats:
-        """Run the full conversion and return the collected statistics."""
+        """Convert ``input_path`` into ``output_path``, one frame at a time.
+
+        Parameters
+        ----------
+        transform:
+            Called as ``transform(frame, index)`` for each decoded frame. It may
+            return a new frame, the same frame, or ``None`` to leave the frame
+            untouched. An exception is caught per frame and counted, and the
+            original frame is written instead, so a single bad frame does not
+            abandon a long conversion. Raise :class:`CancelledError` to stop.
+        progress:
+            Called as ``progress(completed, total, message)``. ``total`` is 0
+            when the container does not report a frame count.
+        preview:
+            Called as ``preview(index, frame)`` every
+            ``performance.preview_interval`` frames, for a live view.
+        on_error:
+            Called as ``on_error(index, message)`` for each failed frame.
+        start_frame:
+            Skip this many frames before processing.
+        max_frames:
+            Stop after this many frames. Defaults to ``video.max_frames`` from
+            the configuration, where ``0`` means "to the end of the file".
+
+        Returns the collected :class:`ProcessingStats`.
+
+        Raises
+        ------
+        VideoReadError
+            The input is missing, corrupt, or not a readable video.
+        VideoWriteError
+            The output file could not be created, for example an unsupported
+            container extension or an unavailable codec.
+        ProcessorError
+            Any other failure while opening either end of the pipeline.
+        """
         self.reset()
-        stats = ProcessingStats(output_path=str(output_path))
+        stats = ProcessingStats(
+            source_path=str(input_path), output_path=str(output_path)
+        )
         started = time.time()
 
-        source = self.load_source_face(source_face_path)
-        reader = VideoReader(target_video_path, self.config.video)
-        info = reader.open().info
-
-        if info.megapixels > self.config.performance.max_frame_megapixels:
-            log.warning(
-                "frame size %.2f MP exceeds the configured limit of %.2f MP; "
-                "the conversion may be slow on this machine",
-                info.megapixels,
-                self.config.performance.max_frame_megapixels,
-            )
-
-        width, height = self.config.video.output_size(info.width, info.height)
-        writer = VideoWriter(
-            output_path,
-            width,
-            height,
-            info.fps,
-            self.config.video,
-            audio_from=target_video_path if self.config.video.copy_audio else None,
-        )
-        writer.open()
-
-        total = info.frame_count or 0
-        limit = self.config.video.max_frames or 0
-        if limit > 0:
-            total = min(total, limit) if total else limit
-        if start_frame > 0:
-            reader.seek(start_frame)
-            stats.frames_read = start_frame
-
+        reader = VideoReader(input_path, self.config.video)
+        writer: Optional[VideoWriter] = None
+        total = 0
         try:
-            for index, frame in enumerate(
-                reader.frames(limit=limit, start=start_frame), start=start_frame
-            ):
-                if self._cancelled:
-                    stats.messages.append(f"cancelled at frame {index}")
-                    log.info("conversion cancelled at frame %d", index)
-                    break
+            info = self._open_reader(reader)
+            stats.width, stats.height = info.width, info.height
+            stats.fps = info.fps
+            stats.duration_seconds = info.duration_seconds
+            self._warn_on_large_frames(info)
 
-                stats.frames_read += 1
-                try:
-                    result, swapped = self.process_frame(frame, source)
-                except (cv2.error, ValueError) as exc:
-                    stats.errors += 1
-                    message = f"frame {index}: {exc}"
-                    stats.messages.append(message)
-                    log.warning("frame %d failed: %s", index, exc)
-                    if on_error is not None:
-                        on_error(index, str(exc))
-                    result, swapped = frame, False
+            limit = self._resolve_limit(max_frames)
+            total = self._resolve_total(info, limit, start_frame)
 
-                if swapped:
-                    stats.frames_swapped += 1
-                else:
-                    stats.frames_skipped += 1
-
-                writer.write(result)
-                stats.frames_written += 1
-
-                interval = self.config.performance.preview_interval
-                if preview is not None and index % interval == 0:
-                    preview(index, result)
-
-                report_every = self.config.performance.progress_interval
-                if progress is not None and index % report_every == 0:
-                    progress(index, total, f"frame {index}")
+            writer = self._open_writer(output_path, info)
+            self._run_loop(
+                reader,
+                writer,
+                transform,
+                stats,
+                total=total,
+                limit=limit,
+                start_frame=start_frame,
+                progress=progress,
+                preview=preview,
+                on_error=on_error,
+            )
         finally:
+            # Release both handles on every path, so no decoder or file lock
+            # outlives the call even when an unexpected error escapes.
             reader.release()
-            stats.output_path = writer.close() or str(output_path)
+            if writer is not None:
+                stats.output_path = writer.close() or str(output_path)
 
         stats.elapsed_seconds = time.time() - started
         if progress is not None:
-            progress(stats.frames_written, total or stats.frames_written, "done")
-        log.info("conversion finished: %s", stats.summary())
+            progress(
+                stats.frames_written,
+                total or stats.frames_written,
+                "cancelled" if stats.cancelled else "done",
+            )
+        log.info("%s -> %s: %s", input_path, output_path, stats.summary())
         return stats
 
-    def preview_swap(
+    def convert(
         self,
-        source_face_path: str | Path,
-        frame: np.ndarray,
+        input_path: str | Path,
+        output_path: str | Path,
+        transform: Optional[FrameTransform] = None,
+        **kwargs,
+    ) -> ProcessingStats:
+        """Alias for :meth:`process_video`."""
+        return self.process_video(input_path, output_path, transform, **kwargs)
+
+    # -- internals ----------------------------------------------------------
+
+    def _open_reader(self, reader: VideoReader) -> VideoInfo:
+        try:
+            return reader.open().info
+        except VideoReadError:
+            raise
+        except (cv2.error, OSError, ValueError) as exc:
+            raise ProcessorError(f"cannot read {reader.path}: {exc}") from exc
+
+    def _open_writer(self, output_path: str | Path, info: VideoInfo) -> VideoWriter:
+        width, height = self.config.video.output_size(info.width, info.height)
+        try:
+            return VideoWriter(
+                output_path,
+                width,
+                height,
+                info.fps,
+                self.config.video,
+                audio_from=info.path if self.config.video.copy_audio else None,
+            ).open()
+        except VideoWriteError:
+            raise
+        except (cv2.error, OSError, ValueError) as exc:
+            raise ProcessorError(f"cannot write {output_path}: {exc}") from exc
+
+    def _warn_on_large_frames(self, info: VideoInfo) -> None:
+        limit = self.config.performance.max_frame_megapixels
+        if limit > 0 and info.megapixels > limit:
+            log.warning(
+                "frame size %.2f MP exceeds the configured %.2f MP; expect slow "
+                "going on a 2 GB machine",
+                info.megapixels,
+                limit,
+            )
+
+    def _resolve_limit(self, max_frames: Optional[int]) -> int:
+        if max_frames is not None:
+            return max(0, int(max_frames))
+        return max(0, int(self.config.video.max_frames or 0))
+
+    @staticmethod
+    def _resolve_total(info: VideoInfo, limit: int, start_frame: int) -> int:
+        """Best available frame total for progress reporting.
+
+        Containers with no frame index report 0, so progress is reported against
+        an unknown total rather than a misleading one.
+        """
+        total = max(0, info.frame_count - max(0, start_frame))
+        if limit > 0:
+            total = min(total, limit) if total else limit
+        return total
+
+    def _run_loop(
+        self,
+        reader: VideoReader,
+        writer: VideoWriter,
+        transform: Optional[FrameTransform],
+        stats: ProcessingStats,
         *,
-        side_by_side: bool = True,
-    ) -> np.ndarray:
-        """Swap a single frame and return a preview image for the GUI."""
-        source = self.load_source_face(source_face_path)
-        result, swapped = self.process_frame(frame, source)
-        if not swapped:
-            log.info("preview frame contained no detectable face")
-        if side_by_side:
-            height = min(frame.shape[0], result.shape[0])
-            original = cv2.resize(
-                frame, (int(frame.shape[1] * height / frame.shape[0]), height)
-            )
-            updated = cv2.resize(
-                result, (int(result.shape[1] * height / result.shape[0]), height)
-            )
-            return np.hstack([original, updated])
+        total: int,
+        limit: int,
+        start_frame: int,
+        progress: Optional[ProgressCallback],
+        preview: Optional[PreviewCallback],
+        on_error: Optional[ErrorCallback],
+    ) -> None:
+        report_every = max(1, int(self.config.performance.progress_interval))
+        preview_every = max(1, int(self.config.performance.preview_interval))
+
+        for index, frame in enumerate(
+            reader.frames(limit=limit, start=start_frame), start=start_frame
+        ):
+            if self._cancelled:
+                stats.cancelled = True
+                # Appended directly: a cancel is a single terminal event and
+                # must survive even if the message cap has been reached.
+                stats.messages.append(f"cancelled at frame {index}")
+                log.info("conversion cancelled at frame %d", index)
+                break
+
+            stats.frames_read += 1
+            result = self._apply_transform(transform, frame, index, stats, on_error)
+
+            if result is None:
+                stats.frames_passed_through += 1
+                result = frame
+            else:
+                stats.frames_transformed += 1
+
+            if not self._write_frame(writer, result, index, stats, on_error):
+                continue
+            stats.frames_written += 1
+
+            if preview is not None and index % preview_every == 0:
+                preview(index, result)
+            if progress is not None and index % report_every == 0:
+                progress(index, total, f"frame {index}")
+
+    def _write_frame(
+        self,
+        writer: VideoWriter,
+        frame: np.ndarray,
+        index: int,
+        stats: ProcessingStats,
+        on_error: Optional[ErrorCallback],
+    ) -> bool:
+        """Write one frame, reporting rather than raising on failure."""
+        try:
+            writer.write(frame)
+        except (VideoWriteError, cv2.error, ValueError) as exc:
+            stats.errors += 1
+            message = f"frame {index}: cannot write ({exc})"
+            stats.add_message(message)
+            log.warning("%s", message)
+            if on_error is not None:
+                on_error(index, str(exc))
+            return False
+        return True
+
+    @staticmethod
+    def _apply_transform(
+        transform: Optional[FrameTransform],
+        frame: np.ndarray,
+        index: int,
+        stats: ProcessingStats,
+        on_error: Optional[ErrorCallback],
+    ) -> Optional[np.ndarray]:
+        """Run the transform, turning any failure into a passed-through frame."""
+        if transform is None:
+            return None
+        try:
+            result = transform(frame, index)
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not end the run
+            stats.errors += 1
+            message = f"frame {index}: {type(exc).__name__}: {exc}"
+            stats.add_message(message)
+            log.warning("%s", message)
+            if on_error is not None:
+                on_error(index, str(exc))
+            return None
+        if result is None:
+            return None
+        if not isinstance(result, np.ndarray):
+            stats.errors += 1
+            message = f"frame {index}: transform returned {type(result).__name__}"
+            stats.add_message(message)
+            log.warning("%s", message)
+            if on_error is not None:
+                on_error(index, message)
+            return None
         return result
 
 
 # ---------------------------------------------------------------------------
 # Image helpers
+#
+# Format utilities rather than video helpers, kept here so the GUI and the later
+# phases share a single import site for file IO.
 # ---------------------------------------------------------------------------
 
 
@@ -345,7 +448,8 @@ def read_image(path: str | Path) -> np.ndarray:
     """Read an image, raising :class:`ProcessorError` when it cannot be decoded.
 
     ``cv2.imread`` handles non ASCII paths poorly on Windows, so the file is
-    read as bytes first and decoded from memory.
+    read as bytes and decoded from memory. That keeps paths containing spaces or
+    accented characters working on the target machine.
     """
     target = Path(path)
     if not target.is_file():
