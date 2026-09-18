@@ -1,0 +1,24 @@
+# LightSwapConverter runtime dependencies.
+#
+# Target environment: Windows 8.1 64-bit, Python 3.10.11, CPU only, 2 GB RAM,
+# fully offline. Every pin below is chosen so that the total installed size
+# stays small and no package downloads a model at runtime.
+#
+# Deliberately absent: onnxruntime, tensorflow, torch, mediapipe, dlib.
+# None of those fit the size, memory or licensing constraints of this project.
+
+# Core array maths. Pinned to the 1.24 series because it is the last line with
+# wheels for Python 3.10 on Windows x64 that predates the numpy 2.x ABI break,
+# and because it stays within the memory budget of a 2 GB machine.
+numpy==1.24.4
+
+# OpenCV supplies video decoding, encoding, Haar cascades and the image
+# operations used by the pipeline. The headless build is smaller and has no
+# GUI dependencies, which is what we want because Tkinter draws our interface.
+opencv-python-headless==4.8.1.78
+
+# Tkinter ships with CPython on Windows, so it is not listed here.
+# No Pillow: the preview converts frames to PPM and hands them to Tkinter.
+
+# --- development and test only (not required to run the application) ---
+# pytest==7.4.4

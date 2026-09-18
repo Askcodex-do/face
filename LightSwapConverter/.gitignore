@@ -1,0 +1,38 @@
+# LightSwapConverter
+
+Byte compiled output and caches.
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and build artifacts.
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments.
+.venv/
+venv/
+env/
+
+# Local configuration and logs. The application writes these to %APPDATA% on
+# Windows, but a portable run can create them next to the source.
+config.json
+*.log
+*.log.*
+
+# Generated media, so a manual test run never ends up committed.
+*_swapped.mp4
+output/
+out/
+
+# Editor and OS noise.
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
