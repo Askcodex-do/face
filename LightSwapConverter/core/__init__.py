@@ -53,15 +53,15 @@ _EXPORTS = {
     "CancelledError": ("processor", "CancelledError"),
     "ProcessingStats": ("processor", "ProcessingStats"),
     "ProcessorError": ("processor", "ProcessorError"),
-    "SourceFace": ("processor", "SourceFace"),
-    "VideoFaceProcessor": ("processor", "VideoFaceProcessor"),
+    "SourceFace": ("swapper", "SourceFace"),
+    "VideoFaceProcessor": ("swapper", "VideoFaceProcessor"),
     "read_image": ("processor", "read_image"),
     "write_image": ("processor", "write_image"),
     "VideoReadError": ("video_reader", "VideoReadError"),
     "VideoReader": ("video_reader", "VideoReader"),
     "VideoWriteError": ("video_writer", "VideoWriteError"),
     "VideoWriter": ("video_writer", "VideoWriter"),
-    "AppConfig": ("config", "AppConfig"),
+    "AppConfig": ("..utils.config", "AppConfig"),
 }
 
 
@@ -70,10 +70,11 @@ def __getattr__(name: str):
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name, attribute = target
-    if module_name == "config":
-        from ..utils import config as module
-    else:
-        from importlib import import_module
+    from importlib import import_module
 
+    if module_name.startswith(".."):
+        # Cross-package export, e.g. ``AppConfig`` from ``utils.config``.
+        module = import_module(module_name, __name__)
+    else:
         module = import_module(f".{module_name}", __name__)
     return getattr(module, attribute)
