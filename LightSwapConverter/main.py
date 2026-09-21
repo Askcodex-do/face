@@ -28,10 +28,8 @@ for candidate in (PACKAGE_PARENT, PROJECT_ROOT):
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
-from LightSwapConverter.core.processor import (  # noqa: E402
-    ProcessorError,
-    VideoFaceProcessor,
-)
+from LightSwapConverter.core.processor import ProcessorError  # noqa: E402
+from LightSwapConverter.core.swapper import VideoFaceProcessor  # noqa: E402
 from LightSwapConverter.core.video_reader import VideoReadError, probe  # noqa: E402
 from LightSwapConverter.utils.config import AppConfig  # noqa: E402
 from LightSwapConverter.utils.logger import get_logger, setup_logging  # noqa: E402

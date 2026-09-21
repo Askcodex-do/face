@@ -219,15 +219,26 @@ class TestReferenceLayout:
         left = points[42:48, 0].mean()
         assert right < left  # "right_eye" appears on the left of the image
 
-    def test_jaw_spans_the_full_width(self):
+    def test_jaw_sits_inside_the_box_not_on_its_edge(self):
+        # The Haar box is wider than the face: the padded box extends past the
+        # jaw on both sides. A layout whose jaw reached the box edge would be
+        # around 70% too wide, which is the defect this asserts against.
         points = reference_layout(FaceBox(0, 0, 100, 100))
-        assert points[0, 0] == pytest.approx(0.0)
-        assert points[16, 0] == pytest.approx(100.0)
+        assert 10.0 < points[0, 0] < 35.0
+        assert 65.0 < points[16, 0] < 90.0
+        jaw_width = points[16, 0] - points[0, 0]
+        assert 40.0 < jaw_width < 65.0
 
-    def test_layout_is_symmetric_about_the_vertical_axis(self):
+    def test_layout_is_symmetric_about_its_own_vertical_axis(self):
         points = reference_layout(FaceBox(0, 0, 100, 100))
-        assert points[0, 0] + points[16, 0] == pytest.approx(100.0)
-        assert points[36, 0] + points[45, 0] == pytest.approx(100.0, abs=1e-4)
+        # The layout's axis of symmetry is where its centre features sit (the
+        # nose bridge, which the annotations place in the middle of the face),
+        # not the centre of the detection box.
+        nose_x = points[27:31, 0].mean()
+        assert points[0, 0] + points[16, 0] == pytest.approx(2 * nose_x, abs=1e-3)
+        assert points[36, 0] + points[45, 0] == pytest.approx(2 * nose_x, abs=1e-3)
+        assert points[42, 0] + points[39, 0] == pytest.approx(2 * nose_x, abs=1e-3)
+        assert points[48, 0] + points[54, 0] == pytest.approx(2 * nose_x, abs=1e-3)
 
 
 class TestLandmarks:
