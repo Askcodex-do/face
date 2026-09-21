@@ -132,6 +132,12 @@ class LandmarkConfig:
     smoothing: float = 0.6
     #: Pixels of blur applied before the eye/eyebrow heuristics.
     blur_radius: int = 3
+    #: How far refinement may move a single landmark from its prior position, as a
+    #: fraction of the face box. Refinement is a small correction to a good
+    #: prior, so this bounds how much a confidently wrong measurement can
+    #: distort the layout. Each point is capped on its own, which keeps the
+    #: shape of the layout intact. Set to 0 to use the prior unchanged.
+    max_refine_shift: float = 0.06
 
     def validate(self) -> List[str]:
         errors: List[str] = []
@@ -141,6 +147,8 @@ class LandmarkConfig:
             errors.append("smoothing must be within [0, 1)")
         if self.blur_radius < 0:
             errors.append("blur_radius must be >= 0")
+        if not 0.0 <= self.max_refine_shift <= 0.5:
+            errors.append("max_refine_shift must be within [0, 0.5]")
         return errors
 
 
@@ -156,6 +164,11 @@ class TransformConfig:
     flip_source: bool = False
     #: Brightness correction applied after warping, in the range [-1, 1].
     brightness: float = 0.0
+    #: How far the face may be stretched before the warp switches from bilinear
+    #: to cubic interpolation. Bilinear is kept for near 1:1 swaps because it is
+    #: the cheapest and loses nothing there; above this the extra sharpness of
+    #: cubic is worth the cost. Set to 0 to always use bilinear.
+    cubic_stretch_threshold: float = 1.5
 
     def validate(self) -> List[str]:
         errors: List[str] = []
@@ -165,6 +178,8 @@ class TransformConfig:
             errors.append("sharpen must be within [0, 2]")
         if not -1.0 <= self.brightness <= 1.0:
             errors.append("brightness must be within [-1, 1]")
+        if self.cubic_stretch_threshold < 0.0:
+            errors.append("cubic_stretch_threshold must be >= 0")
         return errors
 
 

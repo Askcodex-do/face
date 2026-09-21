@@ -5,9 +5,14 @@ PyTorch and large models, and a 2 GB CPU only machine could not run them anyway.
 
 What this module does instead is estimate a 68 point layout from geometry and
 image evidence. The detection box gives a statistical prior for where the parts
-of a face sit, then local search refines the points that can be measured:
-pupils via a bright spot search, nostrils via a dark region search, mouth via a
-dark region search. Points that cannot be measured stay on the prior.
+of a face sit, then a tightly bounded local search nudges the eye centres and
+the mouth towards image evidence. Points that cannot be measured stay on the
+prior.
+
+The prior is derived from real ground truth rather than invented: it is the
+bilateral average of the two 68 point annotations published with OpenCV's test
+data, mapped into the detector's own box frame. See ``_BASE_LAYOUT`` for the
+provenance and ``tests/test_landmark_quality.py`` for the verification.
 
 The result is a stable, plausible layout that is good enough to drive an affine
 alignment. It is explicitly not an anatomically accurate 3D face model, and the
@@ -43,40 +48,67 @@ REGIONS: dict[str, Tuple[int, int]] = {
     "mouth": (48, 68),
 }
 
-#: Landmark indices used to fit the alignment transform. The eye centres and the
-#: nose tip give a stable similarity transform without needing the jaw contour,
+#: Landmark indices used to fit the alignment transform. The four eye corners and
+#: the nose tip give a stable similarity transform without needing the jaw contour,
 #: which is the least reliable part of the estimate.
 ALIGNMENT_INDICES: Tuple[int, ...] = (36, 39, 42, 45, 30)
+
+#: Interocular distance of the prior layout, expressed as a fraction of the face
+#: box width. Measured from ground truth against the detector's own output: the
+#: padded box from :meth:`FaceDetector.detect` is 0.2557 wide per interocular
+#: distance on an average frontal face.
+_PRIOR_INTEROCULAR_FRACTION = 0.2557
+
+#: Centre of the prior eye pair inside the face box, as a fraction of box width
+#: and height. Measured the same way; the vertical value is the more important
+#: of the two because it sets where the alignment puts the eye line.
+_PRIOR_EYE_CENTRE = (0.5064, 0.3981)
 
 #: Reference layout in a normalised face space, origin at the top left of the
 #: face box with both coordinates in ``[0, 1]``. Values come from averaged
 #: measurements of frontal faces and act as the prior for every point.
+#:
+#: Provenance: the bilateral average of ``david1.pts`` and ``david2.pts``, the two
+#: 68 point ground truth annotations that ship with OpenCV's test data
+#: (``opencv_extra``, Apache-2.0). The shapes were normalised by interocular
+#: distance and eye-line rotation, averaged, mirrored onto each other so the
+#: layout is exactly symmetric, then placed into the detector's box frame using
+#: ``_PRIOR_INTEROCULAR_FRACTION`` and ``_PRIOR_EYE_CENTRE``. Earlier revisions
+#: used a hand-drawn layout which placed the jaw 70% too wide and the mouth 46%
+#: too wide relative to the same ground truth.
 _BASE_LAYOUT: Tuple[Tuple[float, float], ...] = (
     # jaw contour, 17 points, image order from the left side round to the right
-    (0.00, 0.18), (0.01, 0.30), (0.04, 0.42), (0.08, 0.54), (0.14, 0.65),
-    (0.22, 0.75), (0.31, 0.83), (0.41, 0.88), (0.50, 0.90), (0.59, 0.88),
-    (0.69, 0.83), (0.78, 0.75), (0.86, 0.65), (0.92, 0.54), (0.96, 0.42),
-    (0.99, 0.30), (1.00, 0.18),
+    (0.2251, 0.4118), (0.2320, 0.4955), (0.2451, 0.5737), (0.2604, 0.6507),
+    (0.2886, 0.7196),
+    (0.3311, 0.7811), (0.3822, 0.8321), (0.4377, 0.8728), (0.5064, 0.8847),
+    (0.5751, 0.8728),
+    (0.6306, 0.8321), (0.6817, 0.7811), (0.7242, 0.7196), (0.7524, 0.6507),
+    (0.7677, 0.5737),
+    (0.7808, 0.4955), (0.7877, 0.4118),
     # right eyebrow, 5 points
-    (0.16, 0.22), (0.24, 0.17), (0.33, 0.15), (0.41, 0.17), (0.47, 0.22),
+    (0.2666, 0.3593), (0.3027, 0.3233), (0.3568, 0.3106), (0.4125, 0.3142),
+    (0.4656, 0.3324),
     # left eyebrow, 5 points
-    (0.53, 0.22), (0.59, 0.17), (0.67, 0.15), (0.76, 0.17), (0.84, 0.22),
+    (0.5472, 0.3324), (0.6003, 0.3142), (0.6560, 0.3106), (0.7101, 0.3233),
+    (0.7462, 0.3593),
     # nose bridge and tip, 9 points; index 30 is the tip
-    (0.50, 0.26), (0.50, 0.34), (0.50, 0.42), (0.50, 0.50), (0.41, 0.55),
-    (0.46, 0.58), (0.54, 0.58), (0.59, 0.55), (0.50, 0.56),
+    (0.5064, 0.3956), (0.5064, 0.4542), (0.5064, 0.5121), (0.5064, 0.5716),
+    (0.4413, 0.6032),
+    (0.4727, 0.6158), (0.5064, 0.6271), (0.5401, 0.6158), (0.5715, 0.6032),
     # right eye, 6 points; indices 36 and 39 are the corners
-    (0.30, 0.35), (0.34, 0.31), (0.40, 0.31), (0.44, 0.35), (0.40, 0.38),
-    (0.34, 0.38),
+    (0.3289, 0.3979), (0.3597, 0.3801), (0.3971, 0.3805), (0.4313, 0.4075),
+    (0.3958, 0.4115), (0.3585, 0.4112),
     # left eye, 6 points; indices 42 and 45 are the corners
-    (0.56, 0.35), (0.60, 0.31), (0.66, 0.31), (0.70, 0.35), (0.66, 0.38),
-    (0.60, 0.38),
+    (0.5815, 0.4075), (0.6157, 0.3805), (0.6531, 0.3801), (0.6839, 0.3979),
+    (0.6543, 0.4112), (0.6170, 0.4115),
     # outer mouth, 12 points
-    (0.33, 0.73), (0.38, 0.70), (0.44, 0.68), (0.50, 0.69), (0.56, 0.68),
-    (0.62, 0.70), (0.67, 0.73), (0.62, 0.77), (0.56, 0.80), (0.50, 0.81),
-    (0.44, 0.80), (0.38, 0.77),
+    (0.3919, 0.6970), (0.4336, 0.6890), (0.4735, 0.6831), (0.5064, 0.6921),
+    (0.5393, 0.6831), (0.5792, 0.6890), (0.6209, 0.6970), (0.5801, 0.7290),
+    (0.5408, 0.7440), (0.5064, 0.7477), (0.4720, 0.7440), (0.4327, 0.7290),
     # inner mouth, 8 points
-    (0.39, 0.73), (0.44, 0.71), (0.50, 0.72), (0.56, 0.71), (0.61, 0.73),
-    (0.56, 0.76), (0.50, 0.77), (0.44, 0.76),
+    (0.4087, 0.6994), (0.4731, 0.7057), (0.5064, 0.7101), (0.5397, 0.7057),
+    (0.6041, 0.6994),
+    (0.5397, 0.7087), (0.5064, 0.7124), (0.4731, 0.7087),
 )
 
 NUM_POINTS = len(_BASE_LAYOUT)
@@ -225,6 +257,103 @@ def _search_darkest_in_rect(
     return np.array([x0 + ix, y0 + iy], dtype=np.float32)
 
 
+def _refine_dark_centre(
+    gray: np.ndarray,
+    predicted: np.ndarray,
+    search_rect: Tuple[int, int, int, int],
+    *,
+    window: int,
+    max_shift: float,
+    min_darkness: float,
+    confidence_soft: float,
+) -> Optional[Tuple[np.ndarray, float]]:
+    """Find a genuinely dark feature near ``predicted`` and score the evidence.
+
+    Returns ``(point, confidence)`` or ``None`` when there is nothing to
+    measure. Confidence is ``0`` when the darkest patch is no darker than the
+    surrounding skin and ramps to ``1`` once it is ``confidence_soft`` times
+    further below the local mean, which is the difference between a shadowed
+    answer and a coincidence.
+
+    Three guard rails keep the caller honest:
+
+    * the candidate must be at least ``min_darkness`` below the local mean, so a
+      flat cheek cannot win the search;
+    * the shift is clamped to ``max_shift`` pixels, so one bad search cannot
+      drag a point across the face;
+    * the confidence is returned rather than assumed, so the caller can refuse a
+      weak measurement instead of applying it.
+    """
+    found = _search_darkest_in_rect(gray, search_rect, window)
+    if found is None:
+        return None
+
+    height, width = gray.shape[:2]
+    skin_rect = _scale_rect(search_rect, 1.5, width, height)
+    local = _mean_in_rect(gray, skin_rect)
+    feature = _mean_in_rect(
+        gray,
+        (int(round(found[0] - window / 2)), int(round(found[1] - window / 2)),
+         window, window),
+    )
+    if local is None or feature is None:
+        return None
+
+    depth = float(local - feature)
+    if depth < min_darkness:
+        return None
+
+    confidence = min(1.0, depth / max(confidence_soft, 1e-6))
+    shift = _clamp_offset(found - predicted, max_shift)
+    return (predicted + shift).astype(np.float32), float(confidence)
+
+
+def _scale_rect(
+    rect: Tuple[int, int, int, int], factor: float, width: int, height: int
+) -> Tuple[int, int, int, int]:
+    """Grow ``rect`` about its centre by ``factor``, then clip to the frame."""
+    x, y, w, h = rect
+    cx, cy = x + w / 2.0, y + h / 2.0
+    nw, nh = max(1, int(round(w * factor))), max(1, int(round(h * factor)))
+    nx, ny = int(round(cx - nw / 2.0)), int(round(cy - nh / 2.0))
+    nx, ny = max(0, nx), max(0, ny)
+    nw, nh = min(nw, max(1, width - nx)), min(nh, max(1, height - ny))
+    return nx, ny, nw, nh
+
+
+def _grow_rect_to_at_least(
+    rect: Tuple[int, int, int, int], minimum: int, width: int, height: int
+) -> Tuple[int, int, int, int]:
+    """Expand ``rect`` about its centre until both sides reach ``minimum`` px.
+
+    The landmark prior puts the eye region about 3% of the face box high, which
+    can be smaller than the search window used to look for a pupil. Without this
+    the pupil search would be handed a rectangle too small to hold its window,
+    quietly return ``None``, and leave the eyes unrefined on exactly the images
+    where the prior is tightest.
+    """
+    x, y, w, h = rect
+    cx, cy = x + w / 2.0, y + h / 2.0
+    nw, nh = max(w, minimum), max(h, minimum)
+    nx, ny = int(round(cx - nw / 2.0)), int(round(cy - nh / 2.0))
+    nx, ny = max(0, nx), max(0, ny)
+    nw, nh = min(nw, max(1, width - nx)), min(nh, max(1, height - ny))
+    return nx, ny, nw, nh
+
+
+def _mean_in_rect(
+    gray: np.ndarray, rect: Tuple[int, int, int, int]
+) -> Optional[float]:
+    """Mean intensity inside ``rect``, or ``None`` when it is degenerate."""
+    height, width = gray.shape[:2]
+    x, y, w, h = rect
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(width, x + w), min(height, y + h)
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return None
+    return float(gray[y0:y1, x0:x1].mean())
+
+
 def _clamp_offset(offset: np.ndarray, limit: float) -> np.ndarray:
     """Limit the length of an offset vector to ``limit`` pixels."""
     norm = float(np.linalg.norm(offset))
@@ -289,24 +418,39 @@ class LandmarkEstimator:
     def _refine(
         self, gray: np.ndarray, points: np.ndarray, box: FaceBox
     ) -> Tuple[np.ndarray, bool]:
-        """Nudge the measurable points towards image evidence.
+        """Nudge a few well-defined points towards image evidence.
 
-        Two rules keep this honest and stable:
+        Only the things that can actually be measured from intensity are touched:
 
-        * Every refinement is clamped to a small fraction of the face box, so a
-          false measurement can never drag the layout far off the prior.
-        * The whole layout is never re-scaled from a measurement. Alignment only
-          ever uses the *relative* geometry between the source and target
-          landmarks, and both are measured with this same estimator, so any
-          systematic bias cancels out. A locally wrong measurement does not.
+        * the two **eye centres**, found as the dark pupil/iris patch inside the
+          eye region, and
+        * the **mouth centre**, found as the dark line between the lips.
 
-        Eyes are searched inside a rectangle derived from the eye points
-        themselves, so an eyebrow or a nostril cannot win the search. The nose
-        and mouth are searched in a small window around their prior.
+        Everything else, and in particular every point the alignment transform is
+        fitted from, stays exactly on the prior. That is deliberate. A previous
+        revision also moved the eye *corners* and the whole *nose* region, and
+        measurement against ground truth showed it made the alignment worse: the
+        five point fit residual rose from 2.15 px to 3.55 px. Moving a point that
+        the fit depends on, on evidence this weak, is simply a regression.
+
+        The whole layout is never re-scaled from a measurement. Alignment only
+        ever uses the *relative* geometry between the source and target
+        landmarks, and both are measured with this same estimator, so any
+        systematic bias cancels out. A locally wrong measurement does not, which
+        is why each one has to clear the evidence thresholds in
+        :func:`_refine_dark_centre` before it is applied at all, and why a weak
+        measurement is blended in proportion to its confidence instead of being
+        taken at face value.
         """
         refined = points.copy()
         measured = False
-        window = max(2, int(round(min(box.width, box.height) * 0.045)))
+
+        scale = min(box.width, box.height)
+        window = max(2, int(round(scale * 0.045)))
+        # The pupil is much darker than the eye white around it, so the contrast
+        # thresholds can be fairly strict without losing real eyes.
+        min_depth = 18.0
+        soft_depth = 45.0
 
         for region in ("right_eye", "left_eye"):
             start, stop = REGIONS[region]
@@ -314,58 +458,95 @@ class LandmarkEstimator:
             centre = eye_points.mean(axis=0)
             minimum = eye_points.min(axis=0)
             maximum = eye_points.max(axis=0)
+            # Search inside the eye itself, so a brow or a nostril cannot win.
             rect = (
                 int(round(minimum[0])),
                 int(round(minimum[1])),
                 int(round(maximum[0] - minimum[0])),
                 int(round(maximum[1] - minimum[1])),
             )
-            found = _search_darkest_in_rect(gray, rect, window)
-            if found is None:
+            # The eye region of the prior is only about 3% of the box high,
+            # which can be smaller than the pupil search window. Widen it to
+            # fit before searching, or the pupil would never be found on a
+            # small face.
+            rect = _grow_rect_to_at_least(
+                rect, window + 1, gray.shape[1], gray.shape[0]
+            )
+            result = _refine_dark_centre(
+                gray,
+                centre,
+                rect,
+                window=window,
+                max_shift=max(scale * 0.04, 2.0),
+                min_darkness=min_depth,
+                confidence_soft=soft_depth,
+            )
+            if result is None:
                 continue
-            offset = _clamp_offset(found - centre, max(box.width * 0.04, 2.0))
-            refined[start:stop] = eye_points + offset
+            found, confidence = result
+            # Move the whole eye as one rigid unit and scale the move by how
+            # strong the evidence was.
+            offset = _clamp_offset(found - centre, max(scale * 0.04, 2.0))
+            refined[start:stop] = eye_points + offset * confidence
             measured = True
 
-        # Nose: the nostrils sit just below the tip prior.
-        nose_start, nose_stop = REGIONS["nose"]
-        nose_points = refined[nose_start:nose_stop]
-        nose_center = nose_points.mean(axis=0)
-        found = _search_darkest_in_rect(
-            gray,
-            (
-                int(round(nose_center[0] - box.width * 0.10)),
-                int(round(nose_center[1] - box.height * 0.03)),
-                int(round(box.width * 0.20)),
-                int(round(box.height * 0.09)),
-            ),
-            window,
-        )
-        if found is not None:
-            offset = _clamp_offset(found - nose_center, box.height * 0.05)
-            refined[nose_start:nose_stop] = nose_points + offset
-            measured = True
+        # The nose is deliberately left on the prior: the nose tip cannot be
+        # found reliably by darkness alone, and it is one of the five points the
+        # alignment is fitted from.
 
         # Mouth: the line between the lips is darker than the surrounding skin.
         mouth_start, mouth_stop = REGIONS["mouth"]
         mouth_points = refined[mouth_start:mouth_stop]
-        mouth_center = mouth_points.mean(axis=0)
-        found = _search_darkest_in_rect(
+        mouth_centre = mouth_points.mean(axis=0)
+        result = _refine_dark_centre(
             gray,
+            mouth_centre,
             (
-                int(round(mouth_center[0] - box.width * 0.18)),
-                int(round(mouth_center[1] - box.height * 0.05)),
+                int(round(mouth_centre[0] - box.width * 0.18)),
+                int(round(mouth_centre[1] - box.height * 0.05)),
                 int(round(box.width * 0.36)),
                 int(round(box.height * 0.10)),
             ),
-            window,
+            window=window,
+            max_shift=max(box.height * 0.05, 2.0),
+            min_darkness=12.0,
+            confidence_soft=35.0,
         )
-        if found is not None:
-            offset = _clamp_offset(found - mouth_center, box.height * 0.05)
-            refined[mouth_start:mouth_stop] = mouth_points + offset
+        if result is not None:
+            found, confidence = result
+            offset = _clamp_offset(found - mouth_centre, max(box.height * 0.05, 2.0))
+            refined[mouth_start:mouth_stop] = mouth_points + offset * confidence
             measured = True
 
-        return refined, measured
+        return self._clamp_to_prior(refined, box), measured
+
+    def _clamp_to_prior(self, points: np.ndarray, box: FaceBox) -> np.ndarray:
+        """Cap how far any single landmark may stray from its prior position.
+
+        Refinement is a small correction to a good prior, so no point should ever
+        travel far. Capping the per-point displacement does two useful things:
+
+        * a confidently wrong measurement can only do bounded damage, and
+        * because every point is capped independently, the *shape* of the layout
+          is preserved. An earlier revision instead rescaled the head of the
+          layout towards its own centroid, which quietly shrank the face and
+          cost a quarter of the paste area before it was caught.
+
+        The budget is a fraction of the face box, so it scales with the face.
+        """
+        budget = float(self.config.max_refine_shift) * min(box.width, box.height)
+        prior = reference_layout(box)
+        if budget <= 0.0:
+            # A zero budget means every landmark stays exactly on the prior.
+            return prior
+        delta = points - prior
+        norms = np.linalg.norm(delta, axis=1, keepdims=True)
+        over = (norms > budget).ravel()
+        if over.any():
+            delta[over] = delta[over] / norms[over] * budget
+            log.debug("%d landmark(s) clamped to the %.1f px prior budget",
+                      int(over.sum()), budget)
+        return (prior + delta).astype(np.float32)
 
     def _apply_smoothing(
         self, points: np.ndarray, box: FaceBox

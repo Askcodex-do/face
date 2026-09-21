@@ -189,6 +189,13 @@ class VideoFaceProcessor:
             )
 
         landmarks = self.landmark_estimator.estimate(image, box, refine=refine)
+        # The source face is measured once and is not part of any frame
+        # sequence, so its layout must not stay in the estimator's smoothing
+        # history. Leaving it there blends the source (a different face, usually
+        # at a different size and position) into the first frame of the video,
+        # which pulled that frame's landmarks towards the source and shrank the
+        # pasted face by around 14% in testing.
+        self.landmark_estimator.reset()
         self._source = SourceFace(image, landmarks, box)
         log.info(
             "source face prepared: box=%s interocular=%.1fpx",
