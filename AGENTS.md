@@ -152,19 +152,107 @@ frame and the paste shrinks, which measured at 14%.
 
 `FaceTransformer` chooses its warp interpolation from the alignment matrix's
 linear scale, not the ratio of the two image sizes. A face can be stretched
-several times inside two near-equal photos. Cubic above
-`cubic_stretch_threshold` (1.5) kept about 15% more fine detail than bilinear on
-faces stretched 3.4x-8.7x; bilinear is kept below that as it is cheaper and
-loses nothing near 1:1. Pre-scaling the source then warping was measured and is
-worse - two resampling passes blur more than one.
+several times inside two near-equal photos.
+
+`cubic_stretch_threshold = 1.5` is **kept**, but the justification recorded above
+was weak and has been corrected by the Phase 2.5 audit:
+
+* The scale is confirmed to track the *face*, not the image. Holding the canvas at
+  700x700 and varying only the drawn face moved the fitted stretch 0.51 -> 2.04
+  and flipped the chosen kernel exactly at the threshold. A whole-image metric
+  could not move in that test.
+* The cost claim was measured wrong the first time. A warp microbenchmark puts
+  cubic at 1.7x-2.9x bilinear, but inside the real pipeline detection dominates
+  and cubic costs about **1%** of wall time (12.29s -> 12.44s on an 80 frame
+  small-face-to-large-face upscale). Do not price this switch from a microbenchmark.
+* The benefit claim was metric dependent. Cubic wins on gradient energy (+24%,
+  "sharper") and on natural 1/f image statistics (+3% to +18% MAE, +0.5 to +1.6 dB
+  PSNR), but *loses* on reconstruction MAE against hard-edged synthetic faces
+  (-6% to -13%). Those fixtures are piecewise flat with hard elliptical edges,
+  which is exactly where bicubic overshoot rings, so they are biased against cubic
+  and must not be used to lower the threshold.
+* Pre-scaling the source then warping was measured and is worse - two resampling
+  passes blur more than one.
+
+Net: 1.5 is a conservative, near-free guard against soft upscales and is left as
+is. Raising or lowering it is not supported by the evidence either way beyond
+"roughly here".
+
+## The refinement bound is a safety net, not a regulator
+
+`max_refine_shift = 0.06` is **kept**. The audit shows it never engages on
+ordinary input, so its value is not sensitive:
+
+* Headroom (budget / largest natural displacement) ranges 1.19 to 2.79 over the
+  validation set, median 1.48. Nothing is throttled.
+* Every shift from 0.04 to 0.12 produces *identical* results, because natural
+  displacements (7-15px) stay under the budget. Below that it does truncate: the
+  cap saturates on all 16 fixtures at 0.02 and on 9 of 16 at 0.04, and accuracy
+  degrades at 0.02 (mean eyeErr 6.57px, against 5.97px at 0.04 and above).
+* A deliberate distractor (a dark blob 90px below the mouth) failed to drag the
+  mouth even with the bound relaxed. What protects the layout is the **confidence
+  gating and the search window**, not the cap. Keep the cap as a backstop.
+* The frozen invariant holds exactly: jaw, brows and nose (indices 0-35) are
+  bit-identical before and after refinement on all 16 fixtures, and a genuinely
+  invisible mouth (`low_mouth_contrast`) moves only points 36-47 while 48-67 stay
+  put. Any change that perturbs indices 0-35 is a regression.
+
+Two harness traps worth not repeating:
+
+* A per-point displacement can exceed the budget by ~1e-5 px from float32
+  rounding. Compare against the budget with a tolerance, or every fixture looks
+  like a violation.
+* Fitting a landmark set to *itself* has exactly zero residual, so a "self-fit
+  alignment residual" metric can never detect anything. Residuals must be measured
+  against drawn ground truth to mean anything.
+
+## Known defect: refinement mis-rotates the eye line on rolled faces
+
+Found by the Phase 2.5 audit, **not fixed** (that phase was validation only). This
+is the top candidate for the next phase.
+
+The prior handles roll correctly - it is placed using the eye-line rotation. The
+refinement search does not: its rectangle is built from the axis-aligned bounds of
+the eye block, so on a rolled face the rectangle is a thin horizontal sliver
+(~9px tall, grown to ~13px) while the true pupil sits outside it. Measured pupil
+excursions outside the search rectangle: 4.6px at +8 degrees, 5.2px at -9, up to
+12px on some fixtures.
+
+When the pupil is outside the rectangle the darkest nearby thing wins, which is the
+eyebrow. The eye block is then dragged up and sideways, and because the two eyes
+fail differently the eye line picks up a *tilt*: with the true roll at -8 degrees
+the refined eye line measures +7.3 degrees, i.e. tilted the wrong way.
+
+Consequences, all bounded but real:
+
+* Eye localisation still improves on these fixtures, but far less than on frontal
+  ones (10.15px -> 9.33px under roll, against 7.99px -> 2.00px on the frontal case).
+* Ground-truth residual gets 3-5x *worse* than the unrefined prior on rolled
+  faces (2.90 -> 9.15 and 2.02 -> 9.73). These are the only fixtures where
+  refinement is a net loss.
+* It does not break conversions: 10/10 frames swap with 0 errors at 0, +/-8, -9
+  and 16 degrees. It degrades paste placement, not success rate.
+
+Any fix should make the search rectangle follow the eye-line rotation rather than
+the axis-aligned bounds, and should keep the 0-35 frozen and confidence-gated
+properties intact.
+
+## Refinement adds about a quarter more inter-frame jitter
+
+At the production smoothing of 0.6, mean frame-to-frame landmark movement on a
+drifting 120 frame clip is 0.812px with refinement off and 1.006px with it on
+(+24%; p95 1.54 -> 1.80px). Sub-pixel in absolute terms, so accepted, but it is
+the real cost of refinement and would show up first on a larger face, where the
+same fraction is more pixels.
 
 ## Status
 
 Foundation complete: structure, config, logging, full pipeline, CLI, GUI, tests.
 Phase 1 complete: video engine with progress, cancellation, format support
 (MP4/AVI/MKV), and measured memory discipline. Phase 2 complete: corrected
-landmark prior, bounded non-inert refinement, resolution-aware warping. 353 tests
-passing. A 400 frame 640x360 clip converts at ~94 fps with 0 errors, peaking near
-100MB.
+landmark prior, bounded non-inert refinement, resolution-aware warping.
+Phase 2.5 complete (validation/audit only): calibration frozen, wider face-set
+results recorded above, one bounded defect documented. 353 tests passing. A 400
+frame 640x360 clip converts at ~94 fps with 0 errors, peaking near 100MB.
 Not done yet: `models/` and `assets/` are empty placeholders; single face only;
 no packaging; not yet run on real Windows 8.1 hardware.
