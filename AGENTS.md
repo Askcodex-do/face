@@ -106,10 +106,65 @@ target. Keep it that way: one frame in flight, no frame lists, no queues, and
 `ProcessingStats.messages` capped by `MAX_RETAINED_MESSAGES` so a file that
 fails on every frame cannot grow the list without bound.
 
+## The landmark prior is calibrated, not invented
+
+`core/landmarks.py` predicts 68 points from the detector's own padded box using a
+fixed prior table. That table is **not** hand-drawn: it is the bilateral average
+of the two 68 point ground truth annotations that ship with OpenCV's test data
+(`opencv_extra`, `david1.pts` / `david2.pts`, Apache-2.0), normalised by
+interocular distance and eye-line rotation, then placed into the box frame using
+two constants: `_PRIOR_INTEROCULAR_FRACTION = 0.2557` and
+`_PRIOR_EYE_CENTRE = (0.5064, 0.3981)`.
+
+Those two constants are the whole calibration. If the detector's box framing ever
+changes, they are the numbers to re-derive, and `tests/test_landmark_quality.py`
+is what will fail if they go stale.
+
+Two traps this codebase has already fallen into, both worth remembering:
+
+* **A wrong prior hides in the alignment fit.** Source and target are described
+  by the same layout, so a systematically wrong shape cancels out of the fitted
+  similarity transform. Alignment residual stays near zero while the paste sits
+  wrongly on the face. Do not treat a low residual as evidence the layout is
+  right; check it against real annotations.
+* **A tight prior can starve the refinement search.** The eye region is about 3%
+  of the box high. If the pupil search window is larger than the rectangle it is
+  given, the search returns nothing and refinement silently becomes inert. Helpers
+  `_grow_rect_to_at_least` and `_scale_rect` exist to prevent this; both are load
+  bearing.
+
+Refinement only touches what darkness can genuinely locate: the two eye centres
+and the mouth. Every measurement returns a confidence that scales the movement,
+and `_clamp_to_prior` caps each point's displacement from the prior
+independently so the layout's shape is preserved. `max_refine_shift = 0` means
+"use the prior unchanged".
+
+## Estimator state is per-sequence
+
+`prepare_source_face()` and `process_frame()` share one `LandmarkEstimator`,
+whose `estimate()` keeps `_previous` for temporal smoothing at a weight of 0.6.
+The source face must be removed from that history before frames are measured -
+`prepare_source_face()` resets it. Without the reset the source (a different
+face, usually a different size and position) is blended into the first video
+frame and the paste shrinks, which measured at 14%.
+
+## Warp interpolation follows the face scale
+
+`FaceTransformer` chooses its warp interpolation from the alignment matrix's
+linear scale, not the ratio of the two image sizes. A face can be stretched
+several times inside two near-equal photos. Cubic above
+`cubic_stretch_threshold` (1.5) kept about 15% more fine detail than bilinear on
+faces stretched 3.4x-8.7x; bilinear is kept below that as it is cheaper and
+loses nothing near 1:1. Pre-scaling the source then warping was measured and is
+worse - two resampling passes blur more than one.
+
 ## Status
 
 Foundation complete: structure, config, logging, full pipeline, CLI, GUI, tests.
 Phase 1 complete: video engine with progress, cancellation, format support
-(MP4/AVI/MKV), and measured memory discipline. 303 tests passing.
+(MP4/AVI/MKV), and measured memory discipline. Phase 2 complete: corrected
+landmark prior, bounded non-inert refinement, resolution-aware warping. 353 tests
+passing. A 400 frame 640x360 clip converts at ~94 fps with 0 errors, peaking near
+100MB.
 Not done yet: `models/` and `assets/` are empty placeholders; single face only;
 no packaging; not yet run on real Windows 8.1 hardware.
